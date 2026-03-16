@@ -1,3 +1,32 @@
+# Changelog - V1.2
+
+- added priority for local card sql database, scryfall used as backup
+
+- added progress bar for mem searching
+
+- removed redundant comments on source code
+
+- fixed issue where the .txt would list items multiple times
+
+- added csv exports for Moxfield
+
+- added card set identifiers to the .txt 
+
+- and more small changes
+
+imported collection to moxfield:
+<img width="1901" height="962" alt="image" src="https://github.com/user-attachments/assets/4f784272-e2fc-4521-8aa1-9137c1029aa4" />
+
+Better text file
+- before: 
+<img width="1080" height="467" alt="image" src="https://github.com/user-attachments/assets/c0bb05cd-4996-4b2a-8c12-7b4bba20aabe" />
+
+- after: 
+<img width="1112" height="480" alt="image" src="https://github.com/user-attachments/assets/9609dd74-69c2-4c85-9ea1-8a9c35aa7d6e" />
+
+Progress bars: 
+<img width="388" height="96" alt="image" src="https://github.com/user-attachments/assets/ccc5c324-3f62-430b-bc74-366c4f9314d9" />
+
 # MTG Arena Collection Exporter
 
 This tool scans your game memory while MTG Arena is running to export your entire card collection.
