@@ -4,10 +4,17 @@ import difflib
 import requests
 import pymem
 import pymem.pattern
+import sys
 from pathlib import Path
 
 # Configuration
-SCRIPT_DIR = Path(__file__).resolve().parent
+if getattr(sys, 'frozen', False):
+    # If running as compiled exe, use the executable's directory
+    SCRIPT_DIR = Path(sys.executable).parent
+else:
+    # If running as python script, use the script's directory
+    SCRIPT_DIR = Path(__file__).resolve().parent
+
 LOOKUP_FILE = SCRIPT_DIR / "arena_id_lookup.json"
 ANCHOR_FILE = SCRIPT_DIR / "last_anchors.json"
 OUTPUT_JSON = SCRIPT_DIR / "mtga_collection.json"
