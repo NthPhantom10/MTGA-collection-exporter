@@ -1,2 +1,2 @@
-pymem
 requests
+pymem; platform_system == "Windows"
