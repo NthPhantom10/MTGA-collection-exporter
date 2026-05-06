@@ -57,8 +57,55 @@ It outputs two files:
 - Try providing different anchor cards if the first attempt fails (rarer anchor cards such as [O:legendary] work better, as they are more unique to your collection).
 - Run as Administrator if you encounter permission errors.
 
+## Filter & re-export by color (cross-platform GUI)
+
+`mtga_export_gui.py` is a small Tkinter app that loads an existing
+`mtga_collection.json` and lets you tick which colors (W/U/B/R/G/Colorless) to
+include before re-exporting to TXT, JSON, or Moxfield-style CSV. It runs on
+**macOS, Linux, and Windows** — only `mtg.py` itself is Windows-only (it scans
+the live MTGA process via `pymem`, and MTG Arena has no native Mac client).
+
+Typical workflow:
+1. On Windows, run `mtg.py` once to produce `mtga_collection.json`.
+2. Copy that JSON to wherever you want to work (Mac, Linux, Windows).
+3. Launch the GUI and pick which colors to export.
+
+### macOS / Linux setup
+
+```bash
+./install.sh
+python3 mtga_export_gui.py
+```
+
+If `tkinter` is missing (common with Homebrew Python), install it first:
+- macOS: `brew install python-tk`
+- Debian/Ubuntu: `sudo apt install python3-tk`
+
+### Windows
+
+After running `install.bat` you can also launch the GUI:
+
+```bat
+python mtga_export_gui.py
+```
+
+### Match modes
+
+- **Any selected color** — include cards that have at least one ticked color
+  (e.g. ticking just W picks up mono-white *and* multicolor cards containing
+  white).
+- **Only selected colors** — include cards whose colors are a subset of the
+  ticked colors (good for building a guild/shard pool).
+- **Exactly the ticked colors** — strict match, e.g. W+U returns only
+  Azorius cards.
+
+Color data is fetched once from Scryfall's bulk catalog and cached in
+`color_cache.json`, so subsequent filters are instant.
+
 ## Files
-- `MTGA_Exporter.exe`: The standalone application.
-- `mtg.py`: The source code.
-- `requirements.txt`: Python dependencies.
-- `install.bat`: Setup script for Python users.
+- `MTGA_Exporter.exe`: The standalone Windows application.
+- `mtg.py`: Windows memory-scan exporter (source).
+- `mtga_export_gui.py`: Cross-platform GUI for color filtering & re-export.
+- `requirements.txt`: Python dependencies (`pymem` is installed on Windows only).
+- `install.bat`: Setup script for Windows.
+- `install.sh`: Setup script for macOS/Linux.
