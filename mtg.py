@@ -1,4 +1,5 @@
 import json
+from pprint import pprint
 import struct
 import difflib
 import requests
@@ -129,9 +130,13 @@ def load_local_mtga_database():
 def fetch_scryfall_database():
     """Downloads card data from Scryfall API."""
     print("Fetching card data from Scryfall API...")
+    headers = {
+        "User-Agent": "MTGACollectionExporter/1.3",
+        "Accept": "application/json"
+    }
     try:
-        bulk_meta = requests.get("https://api.scryfall.com/bulk-data/default-cards", timeout=30).json()
-        cards_data = requests.get(bulk_meta["download_uri"], timeout=120).json()
+        bulk_meta = requests.get("https://api.scryfall.com/bulk-data/default-cards", headers=headers, timeout=30).json()
+        cards_data = requests.get(bulk_meta["download_uri"], headers=headers, timeout=120).json()
         
         lookup = {}
         for c in cards_data:
