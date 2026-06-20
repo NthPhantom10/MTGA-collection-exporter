@@ -1,18 +1,15 @@
-# Changelog - V1.2
+# Changelog - V1.3
 
-- added priority for local card sql database, scryfall used as backup
+- Added macOS support via native Mach VM API
 
-- added progress bar for mem searching
+- Fixed Scryfall API compatibility (custom User-Agent now required)
 
-- removed redundant comments on source code
+- Anchor cards saved and reused between runs
 
-- fixed issue where the .txt would list items multiple times
+- Fuzzy card name matching during anchor input
 
-- added csv exports for Moxfield
+- Small performance and reliability optimizations
 
-- added card set identifiers to the .txt 
-
-- and more small changes
 
 imported collection to moxfield:
 <img width="1901" height="962" alt="image" src="https://github.com/user-attachments/assets/4f784272-e2fc-4521-8aa1-9137c1029aa4" />
@@ -45,20 +42,32 @@ It outputs two files:
 7. Run `MTGA_Exporter.exe`.
 8. Follow the prompts to allow the tool do find and export your collection.
 
-### Option 2: Run from Python Source
+### Option 2: Run from Python Source (Windows & macOS)
 1. Download and extract zip
-3. navigate inside folder
-4. Install Python 3.x.
-5. Run `install.bat` to install dependencies (`pymem`, `requests`).
-6. Run `python mtg.py`.
+2. Navigate inside folder
+3. Install Python 3.10+
+4. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Run `python mtg.py`
+
+> **macOS:** `pymem` is skipped automatically. If you get a permission error, run with `sudo python mtg.py`.
 
 ## Troubleshooting
 - If the tool cannot find your collection, ensure you have visited the Collection/Decks tab.
 - Try providing different anchor cards if the first attempt fails (rarer anchor cards such as [O:legendary] work better, as they are more unique to your collection).
-- Run as Administrator if you encounter permission errors.
+- **Windows:** Run as Administrator if you encounter permission errors.
+- **macOS:** Run with `sudo python mtg.py` if you get a permission error.
+- **First run is slow:** The Scryfall card database (~250 MB) is downloaded once and cached as `arena_id_lookup.json`.
+
+## Output files
+- `mtga_collection.txt`: Readable list — `Count Name (SET)`
+- `mtga_collection.csv`: Moxfield-compatible import
+- `mtga_collection.json`: Full data with count, name, set, and collector number
 
 ## Files
-- `MTGA_Exporter.exe`: The standalone application.
-- `mtg.py`: The source code.
+- `MTGA_Exporter.exe`: Standalone Windows application.
+- `mtg.py`: Source code (Windows + macOS).
 - `requirements.txt`: Python dependencies.
-- `install.bat`: Setup script for Python users.
+- `install.bat`: Setup script for Windows Python users.
