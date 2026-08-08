@@ -37,16 +37,7 @@ It outputs two files:
 
 ## How to use
 
-### Option 1: Run the Executable (Simplest)
-1. Navigate to **Releases**
-2. Download and extract the **zip**
-4. Navigate inside the extradted folder
-5. Ensure **MTG Arena is running**.
-6. Go to the **Decks** or **Collection** tab in-game, scroll for 30 secs through your collection (important so your collection loads into memory).
-7. Run `MTGA_Exporter.exe`.
-8. Follow the prompts to allow the tool do find and export your collection.
-
-### Option 2: Run from Python Source (Windows & macOS)
+### Run from Python Source (Windows & macOS)
 1. Download and extract zip
 2. Navigate inside folder
 3. Install Python 3.10+
