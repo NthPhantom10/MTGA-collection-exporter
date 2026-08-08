@@ -1,3 +1,3 @@
-requests
-psutil
-pymem; sys_platform == "win32"
+requests>=2.32.0
+pymem>=1.13.0 ; sys_platform == "win32"
+psutil>=5.9.0 ; sys_platform == "darwin"
