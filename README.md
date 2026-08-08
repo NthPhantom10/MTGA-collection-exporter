@@ -1,14 +1,18 @@
-# Changelog - V1.3
+# Changelog - V3.3
 
-- Added macOS support via native Mach VM API
+v3.3 Changelog:
+- Fixed Scryfall API fetching (New format).
+- Added full macOS support.
+- Expanded MTGA install path detection (Epic Games, Mac, Linux, Steam VDF).
+- Fixed "unbalanced parenthesis" memory scan crash on Windows.
 
-- Fixed Scryfall API compatibility (custom User-Agent now required)
-
-- Anchor cards saved and reused between runs
-
-- Fuzzy card name matching during anchor input
-
-- Small performance and reliability optimizations
+Improvements from v3.2:
+- Multi-stride memory scanning (8/12/16-byte)
+- all anchors score candidate blocks
+- conditional Scryfall requests 
+- Export formats: Deckbox, MTGGoldfish, Cardsphere, JSON, TXT
+- Collection statistics
+- Proper logging to file & CLI argument support
 
 
 imported collection to moxfield:
