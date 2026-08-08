@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Generated output files
+mtga_collection.json
+mtga_collection.txt
+mtga_collection.csv
+
+# Cached card database and saved anchors (user-specific)
+arena_id_lookup.json
+last_anchors.json
