@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-v3.3 Changelog:
-- Fixed Scryfall API fetching (New format).
-- Added full macOS support.
-- Expanded MTGA install path detection (Epic Games, Mac, Linux, Steam VDF).
-- Fixed "unbalanced parenthesis" memory scan crash on Windows.
-
-Improvements from v3.2:
-- Multi-stride memory scanning (8/12/16-byte)
-- all anchors score candidate blocks
-- conditional Scryfall requests 
-- Export formats: Deckbox, MTGGoldfish, Cardsphere, JSON, TXT
-- Collection statistics
-- Proper logging to file & CLI argument support
+v3.4 Changelog:
+- Fixed large broken quantities by no longer summing duplicate Arena IDs during memory extraction.
+- Duplicate IDs are now tracked and used to penalize/reject dirty memory blocks.
+- Anchor quantities are forced back to the user-provided values when present in the chosen block.
+- Added Moxfield CSV export. (Whoops)
+- Added optional A- prefix normalization for card names when the base name exists in the database.
+- Reduced duplicate export rows by normalizing card names/set codes and merging blank-set duplicates when safe.
+- Added --keep-a-prefix flag.
 """
 
 from __future__ import annotations
@@ -56,12 +51,15 @@ if sys.platform == 'darwin':
     except ImportError:
         print("Error: 'psutil' required on macOS.  pip install psutil")
         sys.exit(1)
-else:
+elif sys.platform == 'win32':
     try:
         import pymem
     except ImportError:
         print("Error: 'pymem' required on Windows.  pip install pymem")
         sys.exit(1)
+else:
+    pymem = None
+
 
 def enable_windows_ansi() -> None:
     if sys.platform == "win32":
@@ -70,6 +68,7 @@ def enable_windows_ansi() -> None:
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
         except Exception:
             pass
+
 
 if sys.platform == 'darwin':
     class MacOSMem:
@@ -128,7 +127,8 @@ if sys.platform == 'darwin':
             ]
 
         def read_bytes(self, address, length):
-            if address < 0 or length <= 0: return b''
+            if address < 0 or length <= 0:
+                return b''
             data_ptr = ctypes.c_uint64(0)
             data_cnt = ctypes.c_uint(0)
             kr = self._lib.mach_vm_read(
@@ -151,7 +151,8 @@ if sys.platform == 'darwin':
                     self._VM_REGION_BASIC_INFO_64, ctypes.byref(info),
                     ctypes.byref(cnt), ctypes.byref(obj),
                 )
-                if kr != self._KERN_SUCCESS: break
+                if kr != self._KERN_SUCCESS:
+                    break
                 if info.protection & self._VM_PROT_READ:
                     yield addr.value, size.value
                 addr.value += size.value
@@ -159,18 +160,23 @@ if sys.platform == 'darwin':
         def pattern_scan_all(self, pattern, return_multiple=False):
             results = []
             for addr, size in self._readable_regions():
-                if size > 256 * 1024 * 1024: continue
+                if size > 256 * 1024 * 1024:
+                    continue
                 try:
                     data = self.read_bytes(addr, size)
-                except OSError: continue
+                except OSError:
+                    continue
                 offset = 0
                 while True:
                     idx = data.find(pattern, offset)
-                    if idx == -1: break
+                    if idx == -1:
+                        break
                     results.append(addr + idx)
-                    if not return_multiple: return results
+                    if not return_multiple:
+                        return results
                     offset = idx + 1
             return results
+
 
 @dataclass
 class Config:
@@ -183,11 +189,15 @@ class Config:
     output_csv_deckbox: Path = Path("mtga_collection_deckbox.csv")
     output_csv_goldfish: Path = Path("mtga_collection_goldfish.csv")
     output_csv_cardsphere: Path = Path("mtga_collection_cardsphere.csv")
+    output_csv_moxfield: Path = Path("mtga_collection_moxfield.csv")
     output_stats: Path = Path("mtga_collection_stats.txt")
+
     include_descriptions: Optional[bool] = None
     force_refresh: bool = False
     auto_open_explorer: bool = True
     verbose: bool = False
+    keep_a_prefix: bool = False
+
     scan_range_mb: int = 8
     min_arena_id: int = 1000
     max_arena_id: int = 900_000
@@ -200,12 +210,21 @@ class Config:
     @classmethod
     def from_base_dir(cls, base: Path) -> "Config":
         c = cls(output_dir=base)
-        for attr in ("lookup_file", "cache_meta_file", "anchor_file",
-                     "output_json", "output_txt", "output_csv_deckbox",
-                     "output_csv_goldfish", "output_csv_cardsphere",
-                     "output_stats"):
+        for attr in (
+            "lookup_file",
+            "cache_meta_file",
+            "anchor_file",
+            "output_json",
+            "output_txt",
+            "output_csv_deckbox",
+            "output_csv_goldfish",
+            "output_csv_cardsphere",
+            "output_csv_moxfield",
+            "output_stats",
+        ):
             setattr(c, attr, base / getattr(c, attr).name)
         return c
+
 
 def setup_logging(cfg: Config) -> None:
     log_path = cfg.output_dir / "mtga_exporter.log"
@@ -219,6 +238,7 @@ def setup_logging(cfg: Config) -> None:
         ],
     )
     logging.info("Log file: %s", log_path)
+
 
 class ProgressBar:
     def __init__(self, total: int, prefix: str = "", length: int = 30):
@@ -241,6 +261,7 @@ class ProgressBar:
     def finish(self, suffix: str = "Done") -> None:
         self.update(self.total, suffix)
         print()
+
 
 class ScanProgressBar:
     def __init__(self, prefix: str = "", length: int = 30):
@@ -277,6 +298,7 @@ class ScanProgressBar:
         sys.stdout.flush()
         print()
 
+
 @dataclass
 class CardInfo:
     arena_id: int
@@ -288,6 +310,7 @@ class CardInfo:
     mana_cost: str = ""
     type_line: str = ""
     release_date: str = ""
+
 
 class DatabaseLoader:
     SCRYFALL_BULK_URL = "https://api.scryfall.com/bulk-data/default-cards"
@@ -320,11 +343,14 @@ class DatabaseLoader:
         return lookup
 
     def _load_cache(self) -> Optional[Dict[int, CardInfo]]:
-        if not self.cfg.lookup_file.exists(): return None
+        if not self.cfg.lookup_file.exists():
+            return None
+
         age_s = time.time() - self.cfg.lookup_file.stat().st_mtime
         if age_s > self.cfg.cache_max_age_days * 86_400:
             self.log.info("Cache is %.1f days old — refreshing", age_s / 86_400)
             return None
+
         try:
             with self.cfg.lookup_file.open("r", encoding="utf-8") as f:
                 raw = json.load(f)
@@ -334,25 +360,39 @@ class DatabaseLoader:
 
         result: Dict[int, CardInfo] = {}
         for k, v in raw.items():
-            if not isinstance(v, dict): continue
+            if not isinstance(v, dict):
+                continue
             try:
                 result[int(k)] = CardInfo(
-                    arena_id=int(k), name=v.get("name", "Unknown"), set=v.get("set", ""),
-                    collector_number=v.get("collector_number", ""), rarity=v.get("rarity", ""),
-                    desc=v.get("desc", ""), mana_cost=v.get("mana_cost", ""),
-                    type_line=v.get("type_line", ""), release_date=v.get("release_date", ""),
+                    arena_id=int(k),
+                    name=v.get("name", "Unknown"),
+                    set=v.get("set", ""),
+                    collector_number=v.get("collector_number", ""),
+                    rarity=v.get("rarity", ""),
+                    desc=v.get("desc", ""),
+                    mana_cost=v.get("mana_cost", ""),
+                    type_line=v.get("type_line", ""),
+                    release_date=v.get("release_date", ""),
                 )
-            except (ValueError, TypeError): continue
+            except (ValueError, TypeError):
+                continue
+
         return result if len(result) > 100 else None
 
     def _save_cache(self, lookup: Dict[int, CardInfo]) -> None:
         try:
             data = {
                 str(k): {
-                    "name": v.name, "set": v.set, "collector_number": v.collector_number,
-                    "rarity": v.rarity, "desc": v.desc, "mana_cost": v.mana_cost,
-                    "type_line": v.type_line, "release_date": v.release_date,
-                } for k, v in lookup.items()
+                    "name": v.name,
+                    "set": v.set,
+                    "collector_number": v.collector_number,
+                    "rarity": v.rarity,
+                    "desc": v.desc,
+                    "mana_cost": v.mana_cost,
+                    "type_line": v.type_line,
+                    "release_date": v.release_date,
+                }
+                for k, v in lookup.items()
             }
             with self.cfg.lookup_file.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
@@ -362,6 +402,7 @@ class DatabaseLoader:
 
     def _find_mtga_raw_path(self) -> Optional[Path]:
         paths_to_check = []
+
         if sys.platform == 'win32':
             paths_to_check.extend([
                 Path(r"C:\Program Files (x86)\Steam\steamapps\common\MTGA\MTGA_Data\Downloads\Raw"),
@@ -374,12 +415,15 @@ class DatabaseLoader:
                 Path(r"D:\Games\MTGA\MTGA_Data\Downloads\Raw"),
                 Path(r"E:\Steam\steamapps\common\MTGA\MTGA_Data\Downloads\Raw"),
             ])
+
             try:
                 import winreg
                 key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam")
                 steam_path, _ = winreg.QueryValueEx(key, "InstallPath")
                 paths_to_check.append(Path(steam_path) / "steamapps" / "common" / "MTGA" / "MTGA_Data" / "Downloads" / "Raw")
-            except Exception: pass
+            except Exception:
+                pass
+
             try:
                 import winreg
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", 0, winreg.KEY_READ)
@@ -391,7 +435,9 @@ class DatabaseLoader:
                     for m in re.finditer(r'"path"\s*"([^"]+)"', text):
                         lib = m.group(1).replace("\\\\", "\\")
                         paths_to_check.append(Path(lib) / "steamapps" / "common" / "MTGA" / "MTGA_Data" / "Downloads" / "Raw")
-            except Exception: pass
+            except Exception:
+                pass
+
         elif sys.platform == 'darwin':
             paths_to_check.extend([
                 Path.home() / "Library/Application Support/Steam/steamapps/common/MTGA/MTGA_Data/Downloads/Raw",
@@ -399,6 +445,7 @@ class DatabaseLoader:
                 Path.home() / "Library/Application Support/com.wizards.mtga/Downloads/Raw",
                 Path.home() / "Library/Application Support/Epic/MTGA/MTGA_Data/Downloads/Raw",
             ])
+
         elif sys.platform.startswith('linux'):
             paths_to_check.extend([
                 Path.home() / ".steam/steam/steamapps/common/MTGA/MTGA_Data/Downloads/Raw",
@@ -407,7 +454,8 @@ class DatabaseLoader:
             ])
 
         for p in paths_to_check:
-            if p.exists(): return p
+            if p.exists():
+                return p
         return None
 
     def _load_local_mtga(self) -> Dict[int, CardInfo]:
@@ -415,6 +463,7 @@ class DatabaseLoader:
         if not raw_path:
             self.log.info("Local MTGA installation not found")
             return {}
+
         self.log.info("Scanning %s", raw_path)
         lookup: Dict[int, CardInfo] = {}
         files = sorted(raw_path.glob("*.mtga"), key=lambda f: f.stat().st_size, reverse=True)
@@ -425,9 +474,12 @@ class DatabaseLoader:
         bar = ProgressBar(len(files), prefix="Local DB:")
         for i, f in enumerate(files):
             bar.update(i, f.name[:20])
-            if f.stat().st_size < 500 * 1024: continue
+            if f.stat().st_size < 500 * 1024:
+                continue
             cards = self._parse_sqlite(f)
-            if cards: lookup.update(cards)
+            if cards:
+                lookup.update(cards)
+
         bar.finish(f"{len(lookup)} cards loaded")
         return lookup
 
@@ -440,10 +492,12 @@ class DatabaseLoader:
             if "Cards" not in tables:
                 conn.close()
                 return result
+
             loc = self._load_localizations(cur, tables)
             if not loc:
                 conn.close()
                 return result
+
             cols = {r[1] for r in cur.execute("PRAGMA table_info(Cards)")}
             q = (
                 "SELECT GrpId, TitleId, "
@@ -453,53 +507,72 @@ class DatabaseLoader:
                 f"{'Rarity' if 'Rarity' in cols else 'NULL'} "
                 "FROM Cards"
             )
+
             for row in cur.execute(q):
                 grp, title, set_code, cn, abil, rarity = row
                 name = loc.get(title, f"Unknown_{grp}")
                 desc = self._build_desc(str(abil) if abil else "", loc)
                 result[grp] = CardInfo(
-                    arena_id=grp, name=name, set=str(set_code) if set_code else "",
-                    collector_number=str(cn) if cn else "", rarity=str(rarity) if rarity else "", desc=desc,
+                    arena_id=grp,
+                    name=name,
+                    set=str(set_code) if set_code else "",
+                    collector_number=str(cn) if cn else "",
+                    rarity=str(rarity) if rarity else "",
+                    desc=desc,
                 )
+
             conn.close()
         except sqlite3.Error as exc:
             self.log.debug("SQLite error in %s: %s", path.name, exc)
         except Exception as exc:
             self.log.debug("Parse error in %s: %s", path.name, exc)
+
         return result
 
     @staticmethod
     def _load_localizations(cur: sqlite3.Cursor, tables: Set[str]) -> Dict[int, str]:
         loc: Dict[int, str] = {}
+
         if "Localizations_enUS" in tables:
             try:
                 for lid, text in cur.execute("SELECT LocId, Loc FROM Localizations_enUS"):
-                    if text: loc[lid] = text
-            except sqlite3.Error: pass
-            if loc: return loc
+                    if text:
+                        loc[lid] = text
+            except sqlite3.Error:
+                pass
+            if loc:
+                return loc
+
         if "Localizations" in tables:
             try:
                 cols = {r[1] for r in cur.execute("PRAGMA table_info(Localizations)")}
                 if {"Id", "Text"} <= cols:
                     q = "SELECT Id, Text FROM Localizations WHERE Format LIKE '%en-US%' OR Format IS NULL"
                     for lid, text in cur.execute(q):
-                        if text: loc[lid] = text
+                        if text:
+                            loc[lid] = text
                 elif {"LocId", "Loc"} <= cols:
                     for lid, text in cur.execute("SELECT LocId, Loc FROM Localizations"):
-                        if text: loc[lid] = text
-            except sqlite3.Error: pass
+                        if text:
+                            loc[lid] = text
+            except sqlite3.Error:
+                pass
+
         return loc
 
     @staticmethod
     def _build_desc(ability_ids: str, loc: Dict[int, str]) -> str:
-        if not ability_ids: return ""
+        if not ability_ids:
+            return ""
         parts: List[str] = []
         for chunk in ability_ids.split(","):
             if ":" in chunk:
                 try:
                     tid = int(chunk.split(":")[-1])
-                    if tid in loc: parts.append(loc[tid])
-                except ValueError: continue
+                    if tid in loc:
+                        parts.append(loc[tid])
+                except ValueError:
+                    continue
         return "\n".join(parts) if parts else ""
 
     def _fetch_scryfall(self) -> Dict[int, CardInfo]:
@@ -510,54 +583,69 @@ class DatabaseLoader:
             meta.raise_for_status()
             bulk = meta.json()
             self.log.info("Scryfall bulk updated: %s", bulk.get("updated_at", "?"))
-            
+
             jsonl_uri = bulk.get("jsonl_download_uri")
             download_uri = bulk.get("download_uri")
             uri = jsonl_uri or download_uri
-            
+
             if not uri:
                 raise ValueError("No download URI found in bulk metadata")
 
             headers: Dict[str, str] = {}
             etag = self._load_etag()
-            if etag: headers["If-None-Match"] = etag
-            
+            if etag:
+                headers["If-None-Match"] = etag
+
             resp = session.get(uri, timeout=300, headers=headers)
             if resp.status_code == 304:
                 self.log.info("Scryfall unchanged (304) — using cache")
                 return self._load_cache() or {}
+
             resp.raise_for_status()
-            
             new_etag = resp.headers.get("ETag")
-            if new_etag: self._save_etag(new_etag)
-            
+            if new_etag:
+                self._save_etag(new_etag)
+
             lookup: Dict[int, CardInfo] = {}
-            
+
             if jsonl_uri:
                 self.log.info("Decompressing Scryfall JSONL...")
                 with gzip.open(io.BytesIO(resp.content), 'rt', encoding='utf-8') as f:
                     for line in f:
-                        if not line.strip(): continue
+                        if not line.strip():
+                            continue
                         c = json.loads(line)
                         aid = c.get("arena_id")
-                        if not aid: continue
+                        if not aid:
+                            continue
                         lookup[aid] = CardInfo(
-                            arena_id=aid, name=c.get("name", "Unknown"), set=c.get("set", "").upper(),
-                            collector_number=c.get("collector_number", ""), rarity=c.get("rarity", ""),
-                            desc=c.get("oracle_text", ""), mana_cost=c.get("mana_cost", ""),
-                            type_line=c.get("type_line", ""), release_date=c.get("released_at", ""),
+                            arena_id=aid,
+                            name=c.get("name", "Unknown"),
+                            set=c.get("set", "").upper(),
+                            collector_number=c.get("collector_number", ""),
+                            rarity=c.get("rarity", ""),
+                            desc=c.get("oracle_text", ""),
+                            mana_cost=c.get("mana_cost", ""),
+                            type_line=c.get("type_line", ""),
+                            release_date=c.get("released_at", ""),
                         )
             else:
                 for c in resp.json():
                     aid = c.get("arena_id")
-                    if not aid: continue
+                    if not aid:
+                        continue
                     lookup[aid] = CardInfo(
-                        arena_id=aid, name=c.get("name", "Unknown"), set=c.get("set", "").upper(),
-                        collector_number=c.get("collector_number", ""), rarity=c.get("rarity", ""),
-                        desc=c.get("oracle_text", ""), mana_cost=c.get("mana_cost", ""),
-                        type_line=c.get("type_line", ""), release_date=c.get("released_at", ""),
+                        arena_id=aid,
+                        name=c.get("name", "Unknown"),
+                        set=c.get("set", "").upper(),
+                        collector_number=c.get("collector_number", ""),
+                        rarity=c.get("rarity", ""),
+                        desc=c.get("oracle_text", ""),
+                        mana_cost=c.get("mana_cost", ""),
+                        type_line=c.get("type_line", ""),
+                        release_date=c.get("released_at", ""),
                     )
-                    
+
             self.log.info("Scryfall: %d cards with arena_id", len(lookup))
             return lookup
         except Exception as exc:
@@ -571,7 +659,7 @@ class DatabaseLoader:
         adapter = HTTPAdapter(max_retries=retry)
         s.mount("http://", adapter)
         s.mount("https://", adapter)
-        s.headers["User-Agent"] = "MTGA-Collection-Exporter/3.3"
+        s.headers["User-Agent"] = "MTGA-Collection-Exporter/3.4"
         return s
 
     def _load_etag(self) -> Optional[str]:
@@ -579,20 +667,24 @@ class DatabaseLoader:
             if self.cfg.cache_meta_file.exists():
                 with self.cfg.cache_meta_file.open("r") as f:
                     return json.load(f).get("scryfall_etag")
-        except Exception: return None
+        except Exception:
+            return None
         return None
 
     def _save_etag(self, etag: str) -> None:
         try:
             with self.cfg.cache_meta_file.open("w") as f:
                 json.dump({"scryfall_etag": etag, "saved_at": datetime.now().isoformat()}, f)
-        except Exception: pass
+        except Exception:
+            pass
+
 
 @dataclass
 class Anchor:
     arena_id: int
     quantity: int
     name: str
+
 
 class AnchorManager:
     MIN_ANCHORS = 3
@@ -613,18 +705,22 @@ class AnchorManager:
 
     def get_anchors(self) -> List[Anchor]:
         saved = self._load_saved()
-        if saved and self._confirm(saved): return saved
+        if saved and self._confirm(saved):
+            return saved
         return self._interactive()
 
     def _load_saved(self) -> Optional[List[Anchor]]:
-        if not self.cfg.anchor_file.exists(): return None
+        if not self.cfg.anchor_file.exists():
+            return None
         try:
             with self.cfg.anchor_file.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            if not isinstance(data, list): return None
+            if not isinstance(data, list):
+                return None
             anchors = [Anchor(a[0], a[1], a[2]) for a in data if isinstance(a, (list, tuple)) and len(a) >= 3]
             return anchors or None
-        except Exception: return None
+        except Exception:
+            return None
 
     def _confirm(self, anchors: List[Anchor]) -> bool:
         print("\n[Previous Anchors]")
@@ -636,17 +732,23 @@ class AnchorManager:
         print(f"\n[Setup] Enter up to {self.RECOMMENDED} cards you own.")
         print("  Rares/Mythics with exact quantities work best.")
         print("  Enter an empty name to finish early (min 3).\n")
+
         anchors: List[Anchor] = []
         used: Set[int] = set()
+
         while len(anchors) < self.MAX_ANCHORS:
             print(f"Card #{len(anchors) + 1}:")
             name_in = input("  Name: ").strip()
             if not name_in:
-                if len(anchors) >= self.MIN_ANCHORS: break
+                if len(anchors) >= self.MIN_ANCHORS:
+                    break
                 print(f"  Need at least {self.MIN_ANCHORS} anchors.")
                 continue
+
             anchor = self._find_card(name_in, used)
-            if anchor is None: continue
+            if anchor is None:
+                continue
+
             try:
                 qty = int(input(f"  Quantity of '{anchor.name}': "))
                 if not 1 <= qty <= 400:
@@ -655,33 +757,45 @@ class AnchorManager:
             except ValueError:
                 print("  Invalid number.")
                 continue
+
             anchor.quantity = qty
             used.add(anchor.arena_id)
             anchors.append(anchor)
             print(f"  ✓ {anchor.name}  (ID {anchor.arena_id}, x{qty})\n")
-        if anchors: self._save(anchors)
+
+        if anchors:
+            self._save(anchors)
         return anchors
 
     def _find_card(self, query: str, used: Set[int]) -> Optional[Anchor]:
         q = query.lower()
+
         if q in self._name_index:
             for aid in self._name_index[q]:
-                if aid not in used: return Anchor(aid, 0, self.db[aid].name)
+                if aid not in used:
+                    return Anchor(aid, 0, self.db[aid].name)
+
         matches = difflib.get_close_matches(q, self._name_index.keys(), n=5, cutoff=0.5)
         if not matches:
             print("  ✗ Not found. Check spelling or refresh the database.")
             return None
+
         if len(matches) == 1:
             name = matches[0]
             print(f"  → {name}")
         else:
             print("  Did you mean?")
-            for i, m in enumerate(matches, 1): print(f"    {i}. {m}")
+            for i, m in enumerate(matches, 1):
+                print(f"    {i}. {m}")
             sel = input("  Select # (Enter to cancel): ").strip()
-            if not sel.isdigit() or not (1 <= int(sel) <= len(matches)): return None
+            if not sel.isdigit() or not (1 <= int(sel) <= len(matches)):
+                return None
             name = matches[int(sel) - 1]
+
         for aid in self._name_index[name]:
-            if aid not in used: return Anchor(aid, 0, self.db[aid].name)
+            if aid not in used:
+                return Anchor(aid, 0, self.db[aid].name)
+
         print("  ✗ Already added. Try a different card.")
         return None
 
@@ -692,6 +806,7 @@ class AnchorManager:
                 json.dump(data, f, indent=2)
         except Exception as exc:
             self.log.warning("Anchor save failed: %s", exc)
+
 
 class MemoryScanner:
     STRIDES_WORDS = (2, 3, 4)
@@ -707,8 +822,11 @@ class MemoryScanner:
         try:
             if sys.platform == 'darwin':
                 self.pm = MacOSMem("MTGA")
-            else:
+            elif sys.platform == 'win32':
                 self.pm = pymem.Pymem("MTGA.exe")
+            else:
+                raise RuntimeError("Memory scanning is supported only on Windows/macOS.")
+
             self.log.info("Connected to MTGA  PID=%d", self.pm.process_id)
             return True
         except Exception as exc:
@@ -722,49 +840,103 @@ class MemoryScanner:
 
     def _run_with_ui(self, func, ui, status, *args):
         root = logging.getLogger()
-        stream_handlers = [h for h in root.handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)]
-        for h in stream_handlers: h.setLevel(logging.CRITICAL)
+        stream_handlers = [
+            h for h in root.handlers
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        ]
+        for h in stream_handlers:
+            h.setLevel(logging.CRITICAL)
+
         result = []
-        def target(): result.append(func(*args))
+
+        def target():
+            result.append(func(*args))
+
         t = threading.Thread(target=target)
         t.start()
+
         while t.is_alive():
             ui.update(status)
             time.sleep(0.08)
+
         t.join()
-        for h in stream_handlers: h.setLevel(logging.DEBUG if self.cfg.verbose else logging.INFO)
+
+        for h in stream_handlers:
+            h.setLevel(logging.DEBUG if self.cfg.verbose else logging.INFO)
+
         return result[0] if result else None
 
     def find_collection(self, anchors: List[Anchor]) -> Optional[Dict[int, int]]:
-        if not self.pm or not anchors: return None
+        if not self.pm or not anchors:
+            return None
+
         ordered = sorted(anchors, key=lambda a: -a.quantity)
         total_anchors = len(ordered)
         ui = ScanProgressBar(f"Memory Scan (0/{total_anchors}):")
+
         for idx, primary in enumerate(ordered):
-            ui.prefix = f"Memory Scan ({idx+1}/{total_anchors}):"
-            self.log.info("Anchor %d/%d: %s (ID %d x%d)", idx + 1, total_anchors, primary.name, primary.arena_id, primary.quantity)
-            addrs = self._run_with_ui(self._scan_anchor, ui, f"Searching for pattern: '{primary.name}' (x{primary.quantity})...", primary)
+            ui.prefix = f"Memory Scan ({idx + 1}/{total_anchors}):"
+            self.log.info(
+                "Anchor %d/%d: %s (ID %d x%d)",
+                idx + 1,
+                total_anchors,
+                primary.name,
+                primary.arena_id,
+                primary.quantity
+            )
+
+            addrs = self._run_with_ui(
+                self._scan_anchor,
+                ui,
+                f"Searching for pattern: '{primary.name}' (x{primary.quantity})...",
+                primary
+            )
+
             if not addrs:
                 ui.update(f"Anchor '{primary.name}' yielded no matches.")
                 time.sleep(1.0)
                 continue
+
             self.log.info("  %d pattern hit(s)", len(addrs))
-            candidates = self._run_with_ui(self._find_blocks, ui, f"Found {len(addrs)} hits. Reading memory & extracting blocks...", addrs)
+
+            candidates = self._run_with_ui(
+                self._find_blocks,
+                ui,
+                f"Found {len(addrs)} hits. Reading memory & extracting blocks...",
+                addrs
+            )
+
             if not candidates:
-                ui.update(f"No valid data blocks found near hits.")
+                ui.update("No valid data blocks found near hits.")
                 time.sleep(1.0)
                 continue
+
             ui.update(f"Scoring {len(candidates)} candidate blocks...")
             time.sleep(0.5)
+
             best = self._select_best(candidates, anchors)
-            if best and self._validate(best):
-                known = sum(1 for k in best if k in self.known_ids)
-                pct = 100 * known / len(best)
-                ui.finish(f"Success! Found collection block with {len(best)} entries.")
-                self.log.info("Collection found: %d entries (%d known, %.1f%%)", len(best), known, pct)
-                return best
-            ui.update(f"Best block failed validation. Trying next anchor...")
+            if best:
+                block, duplicates = best
+                if self._validate(block, duplicates):
+                    for a in anchors:
+                        if a.arena_id in block:
+                            block[a.arena_id] = a.quantity
+
+                    known = sum(1 for k in block if k in self.known_ids)
+                    pct = 100 * known / len(block)
+                    ui.finish(f"Success! Found collection block with {len(block)} entries.")
+                    self.log.info(
+                        "Collection found: %d entries (%d known, %.1f%%, dupes=%d)",
+                        len(block),
+                        known,
+                        pct,
+                        duplicates
+                    )
+                    return block
+
+            ui.update("Best block failed validation. Trying next anchor...")
             time.sleep(1.0)
+
         ui.finish("All anchors exhausted without finding a valid collection.")
         return None
 
@@ -778,85 +950,167 @@ class MemoryScanner:
             self.log.warning("  Scan error: %s", exc)
             return []
 
-    def _find_blocks(self, addresses: List[int]) -> List[Dict[int, int]]:
+    def _find_blocks(self, addresses: List[int]) -> List[Tuple[Dict[int, int], int]]:
         scan_bytes = self.cfg.scan_range_mb * 1024 * 1024
         addresses = sorted(set(addresses))
+
         filtered: List[int] = []
         for a in addresses:
-            if not filtered or a - filtered[-1] > 1024 * 1024: filtered.append(a)
-        blocks: List[Dict[int, int]] = []
-        for addr in filtered: blocks.extend(self._scan_region(addr, scan_bytes))
+            if not filtered or a - filtered[-1] > 1024 * 1024:
+                filtered.append(a)
+
+        blocks: List[Tuple[Dict[int, int], int]] = []
+        for addr in filtered:
+            blocks.extend(self._scan_region(addr, scan_bytes))
+
         return blocks
 
-    def _scan_region(self, addr: int, size: int) -> List[Dict[int, int]]:
+    def _scan_region(self, addr: int, size: int) -> List[Tuple[Dict[int, int], int]]:
         start = max(0, addr - size // 2)
-        try: data = self.pm.read_bytes(start, size)
+        try:
+            data = self.pm.read_bytes(start, size)
         except Exception as exc:
             self.log.debug("Read failed @ %#x: %s", start, exc)
             return []
-        results: List[Dict[int, int]] = []
+
+        results: List[Tuple[Dict[int, int], int]] = []
         for stride_w in self.STRIDES_WORDS:
-            for off_w in range(stride_w): results.extend(self._extract(data, stride_w, off_w))
+            for off_w in range(stride_w):
+                results.extend(self._extract(data, stride_w, off_w))
+
         return results
 
-    def _extract(self, data: bytes, stride_w: int, off_w: int) -> List[Dict[int, int]]:
+    def _extract(self, data: bytes, stride_w: int, off_w: int) -> List[Tuple[Dict[int, int], int]]:
         n_ints = len(data) // 4
-        if n_ints < 2: return []
-        try: ints = struct.unpack_from(f"<{n_ints}I", data)
-        except struct.error: return []
-        blocks: List[Dict[int, int]] = []
+        if n_ints < 2:
+            return []
+
+        try:
+            ints = struct.unpack_from(f"<{n_ints}I", data)
+        except struct.error:
+            return []
+
+        blocks: List[Tuple[Dict[int, int], int]] = []
         current: Dict[int, int] = {}
+        duplicates = 0
         misses = 0
         i = off_w
+
         while i + 1 < n_ints:
             k, v = ints[i], ints[i + 1]
-            if (self.cfg.min_arena_id <= k < self.cfg.max_arena_id and self.cfg.min_qty <= v <= self.cfg.max_qty):
-                current[k] = current.get(k, 0) + v
+
+            if (
+                self.cfg.min_arena_id <= k < self.cfg.max_arena_id
+                and self.cfg.min_qty <= v <= self.cfg.max_qty
+            ):
+                if k in current:
+                    duplicates += 1
+                else:
+                    current[k] = v
                 misses = 0
             else:
                 misses += 1
                 if misses > self.cfg.max_gap:
-                    if len(current) >= self.cfg.min_block_size: blocks.append(current)
+                    if len(current) >= self.cfg.min_block_size:
+                        blocks.append((current, duplicates))
                     current = {}
+                    duplicates = 0
                     misses = 0
+
             i += stride_w
-        if len(current) >= self.cfg.min_block_size: blocks.append(current)
+
+        if len(current) >= self.cfg.min_block_size:
+            blocks.append((current, duplicates))
+
         return blocks
 
-    def _select_best(self, candidates: List[Dict[int, int]], anchors: List[Anchor]) -> Optional[Dict[int, int]]:
-        if not candidates: return None
+    def _select_best(
+        self,
+        candidates: List[Tuple[Dict[int, int], int]],
+        anchors: List[Anchor]
+    ) -> Optional[Tuple[Dict[int, int], int]]:
+        if not candidates:
+            return None
+
         anchor_pairs = {(a.arena_id, a.quantity) for a in anchors}
         anchor_ids = {a.arena_id for a in anchors}
-        n_anchors = len(anchors)
-        scored: List[Tuple[Dict[int, int], float, int, int]] = []
-        for blk in candidates:
-            if not blk: continue
+        n_anchors = max(1, len(anchors))
+
+        scored: List[Tuple[Dict[int, int], float, int, int, int]] = []
+
+        for blk, dupes in candidates:
+            if not blk:
+                continue
+
             known = sum(1 for k in blk if k in self.known_ids)
             known_ratio = known / len(blk)
+
             anchors_exact = sum(1 for k, v in blk.items() if (k, v) in anchor_pairs)
             anchors_id = sum(1 for k in blk if k in anchor_ids)
-            size_score = min(len(blk) / 5000, 1.0)
-            score = (known_ratio * 0.40 + (anchors_exact / n_anchors) * 0.30 + (anchors_id / n_anchors) * 0.15 + size_score * 0.15)
-            scored.append((blk, score, anchors_exact, known))
-        scored.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
-        best = scored[0]
-        self.log.info("  Best block: %d entries, score %.3f, anchors %d/%d, known %d", len(best[0]), best[1], best[2], n_anchors, best[3])
-        return best[0]
 
-    def _validate(self, block: Dict[int, int]) -> bool:
-        if not block: return False
-        if len(block) < 10: return False
-        if len(block) > 100_000: return False
+            size_score = min(len(blk) / 5000, 1.0)
+            dup_ratio = dupes / max(1, len(blk) + dupes)
+
+            score = (
+                known_ratio * 0.35 +
+                (anchors_exact / n_anchors) * 0.35 +
+                (anchors_id / n_anchors) * 0.10 +
+                size_score * 0.10 +
+                (1.0 - dup_ratio) * 0.10
+            )
+
+            scored.append((blk, score, anchors_exact, known, dupes))
+
+        scored.sort(
+            key=lambda x: (
+                x[4] == 0,
+                x[1],
+                x[2],
+                x[3],
+                len(x[0])
+            ),
+            reverse=True
+        )
+
+        best = scored[0]
+        self.log.info(
+            "  Best block: %d entries, score %.3f, anchors %d/%d, known %d, dupes %d",
+            len(best[0]),
+            best[1],
+            best[2],
+            n_anchors,
+            best[3],
+            best[4]
+        )
+
+        return best[0], best[4]
+
+    def _validate(self, block: Dict[int, int], duplicates: int = 0) -> bool:
+        if not block:
+            return False
+        if len(block) < 10:
+            return False
+        if len(block) > 100_000:
+            return False
+
         known = sum(1 for k in block if k in self.known_ids)
         ratio = known / len(block)
+
         if ratio < 0.30:
             self.log.warning("  Low known-ratio: %.1f%%", ratio * 100)
             return False
+
         total = sum(block.values())
         if total > 500_000:
             self.log.warning("  Total quantity too high: %d", total)
             return False
+
+        if duplicates > max(25, int(len(block) * 0.05)):
+            self.log.warning("  High duplicate ID count: %d", duplicates)
+            return False
+
         return True
+
 
 @dataclass
 class CollectionEntry:
@@ -870,52 +1124,132 @@ class CollectionEntry:
     type_line: str = ""
     arena_ids: List[int] = field(default_factory=list)
 
+
 class CollectionWriter:
     def __init__(self, cfg: Config, db: Dict[int, CardInfo]):
         self.cfg = cfg
         self.db = db
         self.log = logging.getLogger(self.__class__.__name__)
+        self._all_names = {info.name.lower() for info in db.values()}
+
+    def _normalize_name(self, name: str) -> str:
+        if not self.cfg.keep_a_prefix and name.startswith("A-"):
+            base = name[2:].strip()
+            if base and base.lower() in self._all_names:
+                return base
+        return name
 
     def write_all(self, collection: Dict[int, int], include_desc: bool = False) -> List[Path]:
         entries = self._aggregate(collection)
         files: List[Path] = []
+
         for writer, args in (
-            (self._write_json, (entries,)), (self._write_txt, (entries, include_desc)),
-            (self._write_deckbox, (entries,)), (self._write_goldfish, (entries,)),
-            (self._write_cardsphere, (entries,)), (self._write_stats, (entries,)),
+            (self._write_json, (entries,)),
+            (self._write_txt, (entries, include_desc)),
+            (self._write_deckbox, (entries,)),
+            (self._write_goldfish, (entries,)),
+            (self._write_cardsphere, (entries,)),
+            (self._write_moxfield, (entries,)),
+            (self._write_stats, (entries,)),
         ):
             path = writer(*args)
-            if path: files.append(path)
+            if path:
+                files.append(path)
+
         return files
 
     def _aggregate(self, collection: Dict[int, int]) -> List[CollectionEntry]:
-        agg: Dict[Tuple[str, str], CollectionEntry] = {}
+        raw: Dict[Tuple[str, str], CollectionEntry] = {}
+
         for cid, qty in collection.items():
             info = self.db.get(cid)
-            if not info: continue
-            key = (info.name, info.set)
-            if key not in agg:
-                agg[key] = CollectionEntry(
-                    count=0, name=info.name, set=info.set, collector_number=info.collector_number,
-                    rarity=info.rarity, desc=info.desc, mana_cost=info.mana_cost, type_line=info.type_line, arena_ids=[],
+            if not info:
+                continue
+
+            name = self._normalize_name(info.name)
+            set_code = (info.set or "").upper()
+            key = (name, set_code)
+
+            if key not in raw:
+                raw[key] = CollectionEntry(
+                    count=0,
+                    name=name,
+                    set=set_code,
+                    collector_number=info.collector_number,
+                    rarity=info.rarity,
+                    desc=info.desc,
+                    mana_cost=info.mana_cost,
+                    type_line=info.type_line,
+                    arena_ids=[],
                 )
-            agg[key].count += qty
-            if cid not in agg[key].arena_ids: agg[key].arena_ids.append(cid)
-        return sorted(agg.values(), key=lambda e: (e.name, e.set))
+
+            raw[key].count += qty
+            if cid not in raw[key].arena_ids:
+                raw[key].arena_ids.append(cid)
+
+        merged = dict(raw)
+        by_name: Dict[str, List[Tuple[Tuple[str, str], CollectionEntry]]] = {}
+
+        for key, entry in raw.items():
+            by_name.setdefault(entry.name, []).append((key, entry))
+
+        for name, items in by_name.items():
+            empty = [(k, e) for k, e in items if not k[1]]
+            if not empty:
+                continue
+
+            nonempty = [(k, e) for k, e in items if k[1]]
+            if len(nonempty) == 1:
+                target_key, target = nonempty[0]
+
+                for key, entry in empty:
+                    target.count += entry.count
+
+                    for aid in entry.arena_ids:
+                        if aid not in target.arena_ids:
+                            target.arena_ids.append(aid)
+
+                    if not target.collector_number and entry.collector_number:
+                        target.collector_number = entry.collector_number
+                    if not target.rarity and entry.rarity:
+                        target.rarity = entry.rarity
+                    if not target.desc and entry.desc:
+                        target.desc = entry.desc
+                    if not target.mana_cost and entry.mana_cost:
+                        target.mana_cost = entry.mana_cost
+                    if not target.type_line and entry.type_line:
+                        target.type_line = entry.type_line
+
+                    merged.pop(key, None)
+
+        return sorted(merged.values(), key=lambda e: (e.name, e.set))
 
     def _write_json(self, entries: List[CollectionEntry]) -> Optional[Path]:
         try:
             data = {
-                "export_date": datetime.now().isoformat(), "total_unique": len(entries),
-                "total_cards": sum(e.count for e in entries), "database_size": len(self.db),
-                "cards": [{
-                    "count": e.count, "name": e.name, "set": e.set, "collector_number": e.collector_number,
-                    "rarity": e.rarity, "mana_cost": e.mana_cost, "type_line": e.type_line,
-                    "oracle_text": e.desc, "arena_ids": e.arena_ids,
-                } for e in entries],
+                "export_date": datetime.now().isoformat(),
+                "total_unique": len(entries),
+                "total_cards": sum(e.count for e in entries),
+                "database_size": len(self.db),
+                "cards": [
+                    {
+                        "count": e.count,
+                        "name": e.name,
+                        "set": e.set,
+                        "collector_number": e.collector_number,
+                        "rarity": e.rarity,
+                        "mana_cost": e.mana_cost,
+                        "type_line": e.type_line,
+                        "oracle_text": e.desc,
+                        "arena_ids": e.arena_ids,
+                    }
+                    for e in entries
+                ],
             }
+
             with self.cfg.output_json.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+
             return self.cfg.output_json
         except Exception as exc:
             self.log.error("JSON write failed: %s", exc)
@@ -925,28 +1259,54 @@ class CollectionWriter:
         try:
             with self.cfg.output_txt.open("w", encoding="utf-8") as f:
                 total = sum(e.count for e in entries)
+
                 f.write("MTGA Collection Export\n")
                 f.write(f"Exported: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"Unique cards: {len(entries)}\n")
                 f.write(f"Total cards:   {total}\n")
                 f.write("=" * 60 + "\n")
+
                 for e in entries:
                     parts = [f"{e.count}x {e.name}"]
-                    if e.set: parts.append(f"({e.set})")
-                    if e.collector_number: parts.append(f"#{e.collector_number}")
-                    if e.rarity: parts.append(f"[{e.rarity}]")
+                    if e.set:
+                        parts.append(f"({e.set})")
+                    if e.collector_number:
+                        parts.append(f"#{e.collector_number}")
+                    if e.rarity:
+                        parts.append(f"[{e.rarity}]")
+
                     f.write(" ".join(parts) + "\n")
+
                     if include_desc:
                         context_parts = []
-                        if e.type_line: context_parts.append(e.type_line)
-                        if e.mana_cost: context_parts.append(e.mana_cost)
+                        if e.type_line:
+                            context_parts.append(e.type_line)
+                        if e.mana_cost:
+                            context_parts.append(e.mana_cost)
+
                         if context_parts:
                             context_str = " | ".join(context_parts)
-                            f.write(textwrap.fill(context_str, width=76, initial_indent="    ", subsequent_indent="    ") + "\n")
+                            f.write(
+                                textwrap.fill(
+                                    context_str,
+                                    width=76,
+                                    initial_indent="    ",
+                                    subsequent_indent="    "
+                                ) + "\n"
+                            )
+
                         if e.desc:
-                            wrapped_desc = textwrap.fill(e.desc, width=76, initial_indent="    ", subsequent_indent="    ", replace_whitespace=False)
+                            wrapped_desc = textwrap.fill(
+                                e.desc,
+                                width=76,
+                                initial_indent="    ",
+                                subsequent_indent="    ",
+                                replace_whitespace=False
+                            )
                             f.write(wrapped_desc + "\n")
+
                     f.write("\n")
+
             self.log.info("TXT  → %s", self.cfg.output_txt)
             return self.cfg.output_txt
         except Exception as exc:
@@ -957,8 +1317,31 @@ class CollectionWriter:
         try:
             with self.cfg.output_csv_deckbox.open("w", encoding="utf-8", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["Count", "Tradelist Count", "Name", "Edition", "Card Number", "Condition", "Language", "Foil", "Signed", "Artist Proof", "Altered Art", "Misprint", "Promo", "Textless", "My Price"])
-                for e in entries: w.writerow([e.count, 0, e.name, e.set, e.collector_number, "Near Mint", "English", "", "", "", "", "", "", "", ""])
+                w.writerow([
+                    "Count", "Tradelist Count", "Name", "Edition", "Card Number",
+                    "Condition", "Language", "Foil", "Signed", "Artist Proof",
+                    "Altered Art", "Misprint", "Promo", "Textless", "My Price"
+                ])
+
+                for e in entries:
+                    w.writerow([
+                        e.count,
+                        0,
+                        e.name,
+                        e.set,
+                        e.collector_number,
+                        "Near Mint",
+                        "English",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        ""
+                    ])
+
             return self.cfg.output_csv_deckbox
         except Exception as exc:
             self.log.error("Deckbox CSV failed: %s", exc)
@@ -969,7 +1352,8 @@ class CollectionWriter:
             with self.cfg.output_csv_goldfish.open("w", encoding="utf-8", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["Card", "Set", "Quantity"])
-                for e in entries: w.writerow([e.name, e.set, e.count])
+                for e in entries:
+                    w.writerow([e.name, e.set, e.count])
             return self.cfg.output_csv_goldfish
         except Exception as exc:
             self.log.error("Goldfish CSV failed: %s", exc)
@@ -980,26 +1364,53 @@ class CollectionWriter:
             with self.cfg.output_csv_cardsphere.open("w", encoding="utf-8", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["Quantity", "Card Name", "Set", "Foil"])
-                for e in entries: w.writerow([e.count, e.name, e.set, "No"])
+                for e in entries:
+                    w.writerow([e.count, e.name, e.set, "No"])
             return self.cfg.output_csv_cardsphere
         except Exception as exc:
             self.log.error("Cardsphere CSV failed: %s", exc)
+            return None
+
+    def _write_moxfield(self, entries: List[CollectionEntry]) -> Optional[Path]:
+        try:
+            with self.cfg.output_csv_moxfield.open("w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Count", "Name", "Edition", "Condition", "Language", "Foil", "Tag"])
+
+                for e in entries:
+                    w.writerow([
+                        e.count,
+                        e.name,
+                        e.set,
+                        "Near Mint",
+                        "English",
+                        "",
+                        ""
+                    ])
+
+            return self.cfg.output_csv_moxfield
+        except Exception as exc:
+            self.log.error("Moxfield CSV failed: %s", exc)
             return None
 
     def _write_stats(self, entries: List[CollectionEntry]) -> Optional[Path]:
         try:
             by_set: Dict[str, Tuple[int, int]] = {}
             by_rarity: Dict[str, Tuple[int, int]] = {}
+
             for e in entries:
                 s = e.set or "Unknown"
                 u, t = by_set.get(s, (0, 0))
                 by_set[s] = (u + 1, t + e.count)
+
                 r = e.rarity or "Unknown"
                 u, t = by_rarity.get(r, (0, 0))
                 by_rarity[r] = (u + 1, t + e.count)
+
             total_unique = len(entries)
             total_cards = sum(e.count for e in entries)
             avg = total_cards / total_unique if total_unique else 0
+
             with self.cfg.output_stats.open("w", encoding="utf-8") as f:
                 f.write("MTGA Collection Statistics\n")
                 f.write(f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
@@ -1008,18 +1419,22 @@ class CollectionWriter:
                 f.write(f"Total cards (qty):   {total_cards}\n")
                 f.write(f"Average copies/card: {avg:.1f}\n")
                 f.write(f"Database size:       {len(self.db)}\n")
+
                 f.write("\n" + "-" * 50 + "\nBy Rarity:\n" + "-" * 50 + "\n")
                 for r in sorted(by_rarity):
                     u, t = by_rarity[r]
                     f.write(f"  {r:15s}  {u:5d} unique  {t:6d} total\n")
+
                 f.write("\n" + "-" * 50 + "\nBy Set:\n" + "-" * 50 + "\n")
                 for s in sorted(by_set):
                     u, t = by_set[s]
                     f.write(f"  {s:10s}  {u:5d} unique  {t:6d} total\n")
+
             return self.cfg.output_stats
         except Exception as exc:
             self.log.error("Stats write failed: %s", exc)
             return None
+
 
 class MTGAExporter:
     def __init__(self, cfg: Config):
@@ -1028,35 +1443,44 @@ class MTGAExporter:
 
     def run(self) -> bool:
         print("=" * 60)
-        print("  MTGA Collection Exporter  v3.3")
+        print("  MTGA Collection Exporter  v3.4")
         print("=" * 60)
         print(f"  Output: {self.cfg.output_dir}\n")
+
         print("[1/4] Loading card database…")
         loader = DatabaseLoader(self.cfg)
         db = loader.load()
+
         if not db:
             print("\n✗ Database initialisation failed.")
             input("Press Enter to exit…")
             return False
+
         print(f"  ✓ {len(db)} cards loaded")
+
         print("\n[2/4] Configuring anchor cards…")
         mgr = AnchorManager(self.cfg, db)
         anchors = mgr.get_anchors()
+
         if len(anchors) < AnchorManager.MIN_ANCHORS:
             print(f"\n✗ Need at least {AnchorManager.MIN_ANCHORS} anchors.")
             input("Press Enter to exit…")
             return False
+
         print(f"  ✓ {len(anchors)} anchors ready")
+
         if self.cfg.include_descriptions is None:
             print("\n[Setup] Include card descriptions in TXT output?")
             resp = input("  [y/N]: ").strip().lower()
             self.cfg.include_descriptions = resp in ('y', 'yes')
         print(f"  → Descriptions {'enabled' if self.cfg.include_descriptions else 'disabled'}")
+
         print("\n[3/4] Scanning MTGA memory…")
         scanner = MemoryScanner(self.cfg, db)
         if not scanner.connect():
             input("Press Enter to exit…")
             return False
+
         collection = scanner.find_collection(anchors)
         if not collection:
             print("\n✗ Could not locate the collection in memory.")
@@ -1067,36 +1491,60 @@ class MTGAExporter:
             print("  • Increase --scan-range (default 8 MB)")
             input("\nPress Enter to exit…")
             return False
+
         print(f"  ✓ {len(collection)} unique entries found")
+
         print("\n[4/4] Writing output files…")
         writer = CollectionWriter(self.cfg, db)
         files = writer.write_all(collection, self.cfg.include_descriptions)
+
         print(f"\n{'=' * 60}")
         print(f"  ✓ Export complete — {len(files)} file(s):")
-        for fp in files: print(f"    • {fp.name}")
+        for fp in files:
+            print(f"    • {fp.name}")
         print(f"{'=' * 60}")
+
         if self.cfg.auto_open_explorer:
             try:
                 if sys.platform == 'darwin':
                     subprocess.Popen(['open', '-R', str(self.cfg.output_txt)])
                 else:
                     subprocess.Popen(f'explorer /select,"{self.cfg.output_txt}"')
-            except Exception: pass
+            except Exception:
+                pass
+
         return True
+
 
 def main() -> None:
     enable_windows_ansi()
-    parser = argparse.ArgumentParser(description="MTGA Collection Exporter v3.3", formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-d", "--descriptions", action="store_true", default=None, help="Force include card oracle text in TXT output")
-    parser.add_argument("--no-descriptions", action="store_false", dest="descriptions", help="Force exclude card oracle text in TXT output")
-    parser.add_argument("-f", "--force-refresh", action="store_true", help="Force-rebuild the card database cache")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    parser.add_argument("--no-explorer", action="store_true", help="Don't auto-open File Explorer after export")
-    parser.add_argument("--scan-range", type=int, default=8, metavar="MB", help="Memory scan window per anchor hit (default 8)")
+
+    parser = argparse.ArgumentParser(
+        description="MTGA Collection Exporter v3.4",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument("-d", "--descriptions", action="store_true", default=None,
+                        help="Force include card oracle text in TXT output")
+    parser.add_argument("--no-descriptions", action="store_false", dest="descriptions",
+                        help="Force exclude card oracle text in TXT output")
+    parser.add_argument("-f", "--force-refresh", action="store_true",
+                        help="Force-rebuild the card database cache")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable debug logging")
+    parser.add_argument("--no-explorer", action="store_true",
+                        help="Don't auto-open File Explorer after export")
+    parser.add_argument("--scan-range", type=int, default=8, metavar="MB",
+                        help="Memory scan window per anchor hit (default 8)")
+    parser.add_argument("--keep-a-prefix", action="store_true",
+                        help="Do not normalize A- prefixed card names")
+
     args = parser.parse_args()
 
-    if getattr(sys, "frozen", False): base = Path(sys.executable).parent
-    else: base = Path(__file__).resolve().parent
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).resolve().parent
 
     cfg = Config.from_base_dir(base)
     cfg.include_descriptions = args.descriptions
@@ -1104,11 +1552,13 @@ def main() -> None:
     cfg.verbose = args.verbose
     cfg.auto_open_explorer = not args.no_explorer
     cfg.scan_range_mb = max(1, args.scan_range)
+    cfg.keep_a_prefix = args.keep_a_prefix
 
     setup_logging(cfg)
     logging.info("Base directory: %s", base)
 
     app = MTGAExporter(cfg)
+
     try:
         success = app.run()
     except KeyboardInterrupt:
@@ -1122,6 +1572,7 @@ def main() -> None:
 
     input("\nPress Enter to exit…")
     sys.exit(0 if success else 1)
+
 
 if __name__ == "__main__":
     main()
