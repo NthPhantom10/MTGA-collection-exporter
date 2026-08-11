@@ -1,18 +1,13 @@
-# Changelog - V3.3
+# Changelog - V3.4
 
-v3.3 Changelog:
-- Fixed Scryfall API fetching (New format).
-- Added full macOS support.
-- Expanded MTGA install path detection (Epic Games, Mac, Linux, Steam VDF).
-- Fixed "unbalanced parenthesis" memory scan crash on Windows.
-
-Improvements from v3.2:
-- Multi-stride memory scanning (8/12/16-byte)
-- all anchors score candidate blocks
-- conditional Scryfall requests 
-- Export formats: Deckbox, MTGGoldfish, Cardsphere, JSON, TXT
-- Collection statistics
-- Proper logging to file & CLI argument support
+v3.4 Changelog:
+- Fixed large broken quantities by no longer summing duplicate Arena IDs during memory extraction.
+- Duplicate IDs are now tracked and used to penalize/reject dirty memory blocks.
+- Anchor quantities are forced back to the user-provided values when present in the chosen block.
+- Added Moxfield CSV export. (Whoops)
+- Added optional A- prefix normalization for card names when the base name exists in the database.
+- Reduced duplicate export rows by normalizing card names/set codes and merging blank-set duplicates when safe.
+- Added --keep-a-prefix flag.
 
 
 imported collection to moxfield:
