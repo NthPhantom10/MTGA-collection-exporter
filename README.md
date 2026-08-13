@@ -38,7 +38,7 @@ It outputs two files:
 3. Install Python 3.10+
 4. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   pip install .
    ```
 5. Run `python mtg.py`
 
@@ -59,5 +59,5 @@ It outputs two files:
 ## Files
 - `MTGA_Exporter.exe`: Standalone Windows application.
 - `mtg.py`: Source code (Windows + macOS).
-- `requirements.txt`: Python dependencies.
+- `pyproject.toml`: Python dependencies.
 - `install.bat`: Setup script for Windows Python users.
