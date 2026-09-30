@@ -178,6 +178,87 @@ if sys.platform == 'darwin':
             return results
 
 
+if sys.platform.startswith('linux'):
+    class LinuxMem:
+        """Linux process memory reader using /proc/<pid>/{maps,mem}."""
+
+        _MAX_REGION = 256 * 1024 * 1024
+        _CHUNK = 32 * 1024 * 1024
+
+        def __init__(self, process_name):
+            self.process_id = self._find_pid(process_name)
+            if not self.process_id:
+                raise RuntimeError(f"Process not found: {process_name}")
+            try:
+                self._fd = os.open(f"/proc/{self.process_id}/mem", os.O_RDONLY)
+            except PermissionError:
+                raise PermissionError(
+                    f"Cannot open /proc/{self.process_id}/mem. Try running with sudo."
+                )
+
+        @staticmethod
+        def _find_pid(process_name):
+            target = process_name.lower()
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    comm = Path(f"/proc/{entry}/comm").read_text().strip()
+                except OSError:
+                    continue
+                if comm.lower() in (target, f"{target}.exe"):
+                    return int(entry)
+            return None
+
+        def read_bytes(self, address, length):
+            if address < 0 or length <= 0:
+                return b''
+            try:
+                data = os.pread(self._fd, length, address)
+            except OSError as exc:
+                raise OSError(f"pread failed @ {address:#x}: {exc}")
+            if not data:
+                raise OSError(f"pread returned no data @ {address:#x}")
+            return data
+
+        def _readable_regions(self):
+            with open(f"/proc/{self.process_id}/maps") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 5 or parts[1][0] != 'r':
+                        continue
+                    path = parts[5] if len(parts) > 5 else ''
+                    if path in ('[vvar]', '[vsyscall]') or path.startswith('/dev/'):
+                        continue
+                    lo, hi = (int(x, 16) for x in parts[0].split('-'))
+                    yield lo, hi - lo
+
+        def pattern_scan_all(self, pattern, return_multiple=False):
+            results = []
+            overlap = len(pattern) - 1
+            for addr, size in self._readable_regions():
+                if size > self._MAX_REGION:
+                    continue
+                pos = 0
+                while pos < size:
+                    want = min(self._CHUNK, size - pos)
+                    try:
+                        data = self.read_bytes(addr + pos, want)
+                    except OSError:
+                        break
+                    offset = 0
+                    while True:
+                        idx = data.find(pattern, offset)
+                        if idx == -1:
+                            break
+                        results.append(addr + pos + idx)
+                        if not return_multiple:
+                            return results
+                        offset = idx + 1
+                    pos += want - overlap if want > overlap else want
+            return results
+
+
 @dataclass
 class Config:
     output_dir: Path = Path(".")
@@ -824,8 +905,10 @@ class MemoryScanner:
                 self.pm = MacOSMem("MTGA")
             elif sys.platform == 'win32':
                 self.pm = pymem.Pymem("MTGA.exe")
+            elif sys.platform.startswith('linux'):
+                self.pm = LinuxMem("MTGA")
             else:
-                raise RuntimeError("Memory scanning is supported only on Windows/macOS.")
+                raise RuntimeError(f"Memory scanning is not supported on {sys.platform}.")
 
             self.log.info("Connected to MTGA  PID=%d", self.pm.process_id)
             return True
@@ -835,7 +918,7 @@ class MemoryScanner:
             print("  1. Launch the game.")
             print("  2. Navigate to the **Decks** tab so your collection")
             print("     is loaded into memory.")
-            print("  3. Run this tool again. (Mac users may need sudo)")
+            print("  3. Run this tool again. (Mac/Linux users may need sudo)")
             return False
 
     def _run_with_ui(self, func, ui, status, *args):
@@ -942,7 +1025,7 @@ class MemoryScanner:
 
     def _scan_anchor(self, anchor: Anchor) -> List[int]:
         pattern = struct.pack("<II", anchor.arena_id, anchor.quantity)
-        if sys.platform != 'darwin':
+        if sys.platform == 'win32':
             pattern = re.escape(pattern)
         try:
             return self.pm.pattern_scan_all(pattern, return_multiple=True)
@@ -1508,6 +1591,8 @@ class MTGAExporter:
             try:
                 if sys.platform == 'darwin':
                     subprocess.Popen(['open', '-R', str(self.cfg.output_txt)])
+                elif sys.platform.startswith('linux'):
+                    subprocess.Popen(['xdg-open', str(self.cfg.output_dir)])
                 else:
                     subprocess.Popen(f'explorer /select,"{self.cfg.output_txt}"')
             except Exception:

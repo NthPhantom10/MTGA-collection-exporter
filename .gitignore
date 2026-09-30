@@ -7,7 +7,9 @@ venv/
 # Generated output files
 mtga_collection.json
 mtga_collection.txt
-mtga_collection.csv
+mtga_collection*.csv
+mtga_collection_stats.txt
+mtga_exporter.log
 
 # Cached card database and saved anchors (user-specific)
 arena_id_lookup.json

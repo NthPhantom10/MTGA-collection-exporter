@@ -32,7 +32,7 @@ It outputs two files:
 
 ## How to use
 
-### Run from Python Source (Windows & macOS)
+### Run from Python Source (Windows, macOS & Linux)
 1. Download and extract zip
 2. Navigate inside folder
 3. Install Python 3.10+
@@ -42,13 +42,16 @@ It outputs two files:
    ```
 5. Run `python mtg.py`
 
-> **macOS:** `pymem` is skipped automatically. If you get a permission error, run with `sudo python mtg.py`.
+> **macOS / Linux:** `pymem` is skipped automatically. If you get a permission error, run with `sudo python mtg.py`.
+>
+> **Linux:** Works with the Steam/Proton build of Arena — the tool reads the `MTGA.exe` process via `/proc/<pid>/mem`. If your system sets `kernel.yama.ptrace_scope` to 1 or higher, run with `sudo`.
 
 ## Troubleshooting
 - If the tool cannot find your collection, ensure you have visited the Collection/Decks tab.
 - Try providing different anchor cards if the first attempt fails (rarer anchor cards such as [O:legendary] work better, as they are more unique to your collection).
 - **Windows:** Run as Administrator if you encounter permission errors.
 - **macOS:** Run with `sudo python mtg.py` if you get a permission error.
+- **Linux:** Run with `sudo python mtg.py` if attaching fails (see `/proc/sys/kernel/yama/ptrace_scope`).
 - **First run is slow:** The Scryfall card database (~250 MB) is downloaded once and cached as `arena_id_lookup.json`.
 
 ## Output files
@@ -58,6 +61,6 @@ It outputs two files:
 
 ## Files
 - `MTGA_Exporter.exe`: Standalone Windows application.
-- `mtg.py`: Source code (Windows + macOS).
+- `mtg.py`: Source code (Windows + macOS + Linux).
 - `pyproject.toml`: Python dependencies.
 - `install.bat`: Setup script for Windows Python users.
