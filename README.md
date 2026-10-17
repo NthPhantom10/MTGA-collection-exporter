@@ -1,3 +1,16 @@
+# Changelog - V3.4.1
+
+v3.4.1 Changelog:
+- **macOS:** freed `mach_vm_read` buffers against the reader's own task port. They were never freed, so a full scan leaked gigabytes.
+- **macOS:** reads now tolerate unmapped holes. `mach_vm_read` fails wholesale if any byte in the requested range is unmapped, so the multi-megabyte windows taken around each anchor hit were silently returning nothing and the collection was never located.
+- Block scoring no longer lets a duplicate-free block outrank one that matches the anchors. The previous sort key preferred small, clean decoy arrays over the real collection.
+- A candidate block must now match at least one anchor. Previously a block matching zero anchors was accepted and written out as a successful export.
+- Card metadata read from the local Arena database now includes mana cost, type line, and a named rarity (`rare` rather than `4`). Only Scryfall supplied these before, and Scryfall was never reached on a machine with Arena installed.
+- Rules text no longer carries Arena's raw mana placeholders: `{oT}`, `{o2oB}` and `{o(G/W)}` now render as `{T}`, `{2}{B}` and `{G/W}`. ICU message placeholders such as `{1, CardId}` and prose in braces are preserved verbatim.
+- Anchor setup asks which printing you mean when a card name has several, instead of silently picking one. The wrong printing produces zero memory hits.
+- Cached card databases are now versioned, so caches written by older versions are rebuilt automatically.
+- Added a pytest suite covering rarity/mana/type-line extraction, rules-text normalisation, cache versioning, and printing selection.
+
 # Changelog - V3.4
 
 v3.4 Changelog:
@@ -26,7 +39,7 @@ Progress bars:
 # MTG Arena Collection Exporter
 
 This tool scans your game memory while MTG Arena is running to export your entire card collection.
-It outputs two files:
+It outputs seven files (listed under [Output files](#output-files)); the two main ones are:
 - `mtga_collection.json`: Full data including card IDs and quantities.
 - `mtga_collection.txt`: A readable list of your cards (Count + Name).
 
@@ -52,12 +65,16 @@ It outputs two files:
 - **Windows:** Run as Administrator if you encounter permission errors.
 - **macOS:** Run with `sudo python mtg.py` if you get a permission error.
 - **Linux:** Run with `sudo python mtg.py` if attaching fails (see `/proc/sys/kernel/yama/ptrace_scope`).
-- **First run is slow:** The Scryfall card database (~250 MB) is downloaded once and cached as `arena_id_lookup.json`.
+- **First run:** card data is read from your local Arena files (`MTGA_Data/Downloads/Raw`) and cached as `arena_id_lookup.json`. The Scryfall bulk download (~250 MB) is only used when no local Arena install is found. Use `--force-refresh` to rebuild the cache.
 
 ## Output files
-- `mtga_collection.txt`: Readable list — `Count Name (SET)`
-- `mtga_collection.csv`: Moxfield-compatible import
-- `mtga_collection.json`: Full data with count, name, set, and collector number
+- `mtga_collection.txt`: Readable list — `Count x Name (SET) #Number [rarity]`
+- `mtga_collection.json`: Full data with count, name, set, collector number, rarity, mana cost, type line and oracle text
+- `mtga_collection_moxfield.csv`: Moxfield import
+- `mtga_collection_deckbox.csv`: Deckbox import
+- `mtga_collection_goldfish.csv`: MTGGoldfish import
+- `mtga_collection_cardsphere.csv`: CardSphere import
+- `mtga_collection_stats.txt`: Totals broken down by rarity and by set
 
 ## Files
 - `MTGA_Exporter.exe`: Standalone Windows application.

@@ -34,6 +34,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+__version__ = "3.4.1"
+
 try:
     import requests
     from requests.adapters import HTTPAdapter
@@ -106,6 +108,7 @@ if sys.platform == 'darwin':
                 raise RuntimeError(f"Process not found: {process_name}")
 
             self_task = ctypes.c_uint.in_dll(self._lib, 'mach_task_self_').value
+            self._self_task = self_task
             self._task = ctypes.c_uint(0)
             kr = self._lib.task_for_pid(self_task, self.process_id, ctypes.byref(self._task))
             if kr != self._KERN_SUCCESS:
@@ -125,19 +128,48 @@ if sys.platform == 'darwin':
                 ctypes.c_uint, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
                 ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
             ]
+            lib.mach_vm_deallocate.restype = ctypes.c_int
+            lib.mach_vm_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint64, ctypes.c_uint64]
 
-        def read_bytes(self, address, length):
-            if address < 0 or length <= 0:
-                return b''
+        _MIN_READ = 64 * 1024
+
+        def _read_one(self, address, length):
+            """One mach_vm_read. Returns b'' if any byte in range is unmapped."""
             data_ptr = ctypes.c_uint64(0)
             data_cnt = ctypes.c_uint(0)
             kr = self._lib.mach_vm_read(
                 self._task.value, address, length,
                 ctypes.byref(data_ptr), ctypes.byref(data_cnt),
             )
-            if kr != self._KERN_SUCCESS:
-                raise OSError(f"mach_vm_read failed: {kr}")
-            return ctypes.string_at(data_ptr.value, data_cnt.value)
+            if kr != self._KERN_SUCCESS or not data_ptr.value:
+                return b''
+            # mach_vm_read allocates the return buffer in *this* task. It must be
+            # freed against mach_task_self(); passing the target task port here
+            # unmaps live memory inside the target process and crashes it.
+            try:
+                return ctypes.string_at(data_ptr.value, data_cnt.value)
+            finally:
+                self._lib.mach_vm_deallocate(self._self_task, data_ptr.value, data_cnt.value)
+
+        def read_bytes(self, address, length):
+            """Read `length` bytes, tolerating unmapped holes in the range.
+
+            mach_vm_read has no partial-read semantics: one unmapped byte fails
+            the whole call with KERN_INVALID_ADDRESS. The scanner requests
+            multi-megabyte windows around each anchor hit, so bisect on failure
+            down to _MIN_READ and concatenate whatever is mapped instead of
+            discarding the entire window. Skipping a hole shifts subsequent
+            offsets, which only breaks an extraction run at the discontinuity.
+            """
+            if address < 0 or length <= 0:
+                return b''
+            data = self._read_one(address, length)
+            if data:
+                return data
+            if length <= self._MIN_READ:
+                return b''
+            half = length // 2
+            return self.read_bytes(address, half) + self.read_bytes(address + half, length - half)
 
         def _readable_regions(self):
             addr = ctypes.c_uint64(0)
@@ -393,6 +425,134 @@ class CardInfo:
     release_date: str = ""
 
 
+# MTGA stores rarity as an enum ordinal; every export consumer expects a name.
+# 0 means "no rarity" (tokens and some digital-only cards).
+RARITY_NAMES: Dict[int, str] = {
+    1: "basic",
+    2: "common",
+    3: "uncommon",
+    4: "rare",
+    5: "mythic",
+}
+
+# Bumped whenever cached card metadata gains or changes fields, so caches
+# written by older versions are rebuilt instead of silently reused.
+CACHE_VERSION = 3
+
+# MTGA's OldSchoolManaText encodes every symbol as 'o' plus the symbol, with
+# hybrid and phyrexian symbols parenthesised: 'o4oGo(G/W)' -> '{4}{G}{G/W}'.
+
+
+def normalize_rarity(value: Any) -> str:
+    """Map an MTGA rarity ordinal, or an already-named rarity, to a name."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return RARITY_NAMES.get(int(text), "")
+        return text.lower()
+    return RARITY_NAMES.get(int(value), "")
+
+
+def convert_mana_text(text: Optional[str]) -> str:
+    """Convert MTGA OldSchoolManaText to Scryfall-style brace notation.
+
+    Each symbol is 'o' followed either by a parenthesised hybrid/phyrexian
+    symbol or by a bare one: 'o4oGo(G/W)' becomes '{4}{G}{G/W}'.
+    """
+    if not text:
+        return ""
+
+    symbols: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "o":
+            i += 1
+            continue
+        i += 1
+        if i < n and text[i] == "(":
+            end = text.find(")", i)
+            if end == -1:
+                break
+            symbols.append(text[i + 1:end])
+            i = end + 1
+        else:
+            j = i
+            while j < n and text[j] not in "o(":
+                j += 1
+            symbols.append(text[i:j])
+            i = j
+
+    return "".join("{" + s.strip() + "}" for s in symbols if s.strip())
+
+
+def _braced_mana(interior: str) -> Optional[str]:
+    """Brace notation for an '{o...}' interior, or None when it is not mana.
+
+    Acceptance requires that rebuilding MTGA's notation from the result
+    reproduces the interior exactly. That round-trip is what rejects ICU
+    MessageFormat placeholders ('{1, CardId}'), keywords ('{Cost}') and prose
+    in braces ('{Discard a card.}') without needing a blacklist.
+    """
+    if not interior.startswith("o"):
+        return None
+    converted = convert_mana_text(interior)
+    if not converted:
+        return None
+    rebuilt = "".join(
+        f"o({part})" if "/" in part else f"o{part}"
+        for part in converted[1:-1].split("}{")
+    )
+    return converted if rebuilt == interior else None
+
+
+def normalize_rules_text(text: Optional[str]) -> str:
+    """Rewrite MTGA's inline '{oX}' mana placeholders to brace notation.
+
+    Rules text stores costs as '{oT}', '{o2oB}' and '{o(G/W)}'. Groups that are
+    not mana are copied through one character at a time, so nested braces inside
+    ICU plural blocks and unbalanced braces survive untouched.
+    """
+    if not text:
+        return ""
+
+    out: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            out.append(text[i])
+            i += 1
+            continue
+
+        end = text.find("}", i + 1)
+        if end == -1:
+            out.append(text[i:])
+            break
+
+        replacement = _braced_mana(text[i + 1:end])
+        if replacement is None:
+            out.append("{")
+            i += 1
+            continue
+
+        out.append(replacement)
+        i = end + 1
+
+    return "".join(out)
+
+
+def build_type_line(supertype: Optional[str], subtype: Optional[str]) -> str:
+    """Join MTGA's split type columns into one Scryfall-style type line."""
+    if not supertype:
+        return ""
+    if not subtype:
+        return str(supertype)
+    return f"{supertype} \u2014 {subtype}"
+
+
 class DatabaseLoader:
     SCRYFALL_BULK_URL = "https://api.scryfall.com/bulk-data/default-cards"
 
@@ -427,6 +587,15 @@ class DatabaseLoader:
         if not self.cfg.lookup_file.exists():
             return None
 
+        version = self._read_cache_version()
+        if version != CACHE_VERSION:
+            self.log.info(
+                "Cache schema %s is outdated (current v%d) — rebuilding",
+                f"v{version}" if version is not None else "(unversioned)",
+                CACHE_VERSION,
+            )
+            return None
+
         age_s = time.time() - self.cfg.lookup_file.stat().st_mtime
         if age_s > self.cfg.cache_max_age_days * 86_400:
             self.log.info("Cache is %.1f days old — refreshing", age_s / 86_400)
@@ -449,7 +618,7 @@ class DatabaseLoader:
                     name=v.get("name", "Unknown"),
                     set=v.get("set", ""),
                     collector_number=v.get("collector_number", ""),
-                    rarity=v.get("rarity", ""),
+                    rarity=normalize_rarity(v.get("rarity", "")),
                     desc=v.get("desc", ""),
                     mana_cost=v.get("mana_cost", ""),
                     type_line=v.get("type_line", ""),
@@ -459,6 +628,13 @@ class DatabaseLoader:
                 continue
 
         return result if len(result) > 100 else None
+
+    def _read_cache_version(self) -> Optional[int]:
+        try:
+            with self.cfg.cache_meta_file.open("r", encoding="utf-8") as f:
+                return json.load(f).get("version")
+        except Exception:
+            return None
 
     def _save_cache(self, lookup: Dict[int, CardInfo]) -> None:
         try:
@@ -477,6 +653,8 @@ class DatabaseLoader:
             }
             with self.cfg.lookup_file.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
+            with self.cfg.cache_meta_file.open("w", encoding="utf-8") as f:
+                json.dump({"version": CACHE_VERSION, "cards": len(lookup)}, f)
             self.log.info("Cache saved → %s", self.cfg.lookup_file)
         except Exception as exc:
             self.log.warning("Cache save failed: %s", exc)
@@ -580,26 +758,31 @@ class DatabaseLoader:
                 return result
 
             cols = {r[1] for r in cur.execute("PRAGMA table_info(Cards)")}
+
+            def col(name: str) -> str:
+                return name if name in cols else "NULL"
+
             q = (
                 "SELECT GrpId, TitleId, "
-                f"{'ExpansionCode' if 'ExpansionCode' in cols else 'NULL'}, "
-                f"{'CollectorNumber' if 'CollectorNumber' in cols else 'NULL'}, "
-                f"{'AbilityIds' if 'AbilityIds' in cols else 'NULL'}, "
-                f"{'Rarity' if 'Rarity' in cols else 'NULL'} "
+                f"{col('ExpansionCode')}, {col('CollectorNumber')}, "
+                f"{col('AbilityIds')}, {col('Rarity')}, "
+                f"{col('TypeTextId')}, {col('SubtypeTextId')}, "
+                f"{col('OldSchoolManaText')} "
                 "FROM Cards"
             )
 
             for row in cur.execute(q):
-                grp, title, set_code, cn, abil, rarity = row
+                grp, title, set_code, cn, abil, rarity, type_id, sub_id, mana = row
                 name = loc.get(title, f"Unknown_{grp}")
-                desc = self._build_desc(str(abil) if abil else "", loc)
                 result[grp] = CardInfo(
                     arena_id=grp,
                     name=name,
                     set=str(set_code) if set_code else "",
                     collector_number=str(cn) if cn else "",
-                    rarity=str(rarity) if rarity else "",
-                    desc=desc,
+                    rarity=normalize_rarity(rarity),
+                    desc=self._build_desc(str(abil) if abil else "", loc),
+                    mana_cost=convert_mana_text(mana),
+                    type_line=build_type_line(loc.get(type_id), loc.get(sub_id)),
                 )
 
             conn.close()
@@ -651,7 +834,7 @@ class DatabaseLoader:
                 try:
                     tid = int(chunk.split(":")[-1])
                     if tid in loc:
-                        parts.append(loc[tid])
+                        parts.append(normalize_rules_text(loc[tid]))
                 except ValueError:
                     continue
         return "\n".join(parts) if parts else ""
@@ -740,7 +923,7 @@ class DatabaseLoader:
         adapter = HTTPAdapter(max_retries=retry)
         s.mount("http://", adapter)
         s.mount("https://", adapter)
-        s.headers["User-Agent"] = "MTGA-Collection-Exporter/3.4"
+        s.headers["User-Agent"] = f"MTGA-Collection-Exporter/{__version__}"
         return s
 
     def _load_etag(self) -> Optional[str]:
@@ -852,33 +1035,63 @@ class AnchorManager:
         q = query.lower()
 
         if q in self._name_index:
-            for aid in self._name_index[q]:
-                if aid not in used:
-                    return Anchor(aid, 0, self.db[aid].name)
+            name = q
+        else:
+            matches = difflib.get_close_matches(q, self._name_index.keys(), n=5, cutoff=0.5)
+            if not matches:
+                print("  ✗ Not found. Check spelling or refresh the database.")
+                return None
 
-        matches = difflib.get_close_matches(q, self._name_index.keys(), n=5, cutoff=0.5)
-        if not matches:
-            print("  ✗ Not found. Check spelling or refresh the database.")
+            if len(matches) == 1:
+                name = matches[0]
+                print(f"  → {name}")
+            else:
+                print("  Did you mean?")
+                for i, m in enumerate(matches, 1):
+                    print(f"    {i}. {m}")
+                sel = input("  Select # (Enter to cancel): ").strip()
+                if not sel.isdigit() or not (1 <= int(sel) <= len(matches)):
+                    return None
+                name = matches[int(sel) - 1]
+
+        return self._pick_printing(name, used)
+
+    def _pick_printing(self, name: str, used: Set[int]) -> Optional[Anchor]:
+        """Choose which printing of `name` to anchor on.
+
+        MTGA keys the collection by per-printing GrpId, so silently taking the
+        first match can anchor on a printing the player does not own, and the
+        memory scan then finds nothing. Newest GrpId first: later printings are
+        the ones a live account most likely holds.
+        """
+        candidates = sorted(
+            (aid for aid in self._name_index.get(name, []) if aid not in used),
+            reverse=True,
+        )
+        if not candidates:
+            print("  ✗ Already added. Try a different card.")
             return None
 
-        if len(matches) == 1:
-            name = matches[0]
-            print(f"  → {name}")
+        if len(candidates) == 1:
+            aid = candidates[0]
+            return Anchor(aid, 0, self.db[aid].name)
+
+        print(f"  {len(candidates)} printings of '{self.db[candidates[0]].name}':")
+        for i, aid in enumerate(candidates, 1):
+            info = self.db[aid]
+            print(f"    {i}. {info.set or '?'} #{info.collector_number or '?'}"
+                  f"  ({info.rarity or '?'})  [id {aid}]")
+
+        sel = input("  Select # (Enter for 1): ").strip()
+        if not sel:
+            idx = 1
+        elif sel.isdigit() and 1 <= int(sel) <= len(candidates):
+            idx = int(sel)
         else:
-            print("  Did you mean?")
-            for i, m in enumerate(matches, 1):
-                print(f"    {i}. {m}")
-            sel = input("  Select # (Enter to cancel): ").strip()
-            if not sel.isdigit() or not (1 <= int(sel) <= len(matches)):
-                return None
-            name = matches[int(sel) - 1]
+            return None
 
-        for aid in self._name_index[name]:
-            if aid not in used:
-                return Anchor(aid, 0, self.db[aid].name)
-
-        print("  ✗ Already added. Try a different card.")
-        return None
+        aid = candidates[idx - 1]
+        return Anchor(aid, 0, self.db[aid].name)
 
     def _save(self, anchors: List[Anchor]) -> None:
         try:
@@ -1000,7 +1213,7 @@ class MemoryScanner:
             best = self._select_best(candidates, anchors)
             if best:
                 block, duplicates = best
-                if self._validate(block, duplicates):
+                if self._validate(block, duplicates, anchors):
                     for a in anchors:
                         if a.arena_id in block:
                             block[a.arena_id] = a.quantity
@@ -1144,9 +1357,13 @@ class MemoryScanner:
 
             scored.append((blk, score, anchors_exact, known, dupes))
 
+        # Sort on score alone. The previous primary key `x[4] == 0` made any
+        # zero-duplicate block outrank every block containing duplicates,
+        # regardless of score, so a small clean decoy array beat the real
+        # collection. Duplicate rate is already weighted in the score and
+        # bounded by _validate.
         scored.sort(
             key=lambda x: (
-                x[4] == 0,
                 x[1],
                 x[2],
                 x[3],
@@ -1168,7 +1385,8 @@ class MemoryScanner:
 
         return best[0], best[4]
 
-    def _validate(self, block: Dict[int, int], duplicates: int = 0) -> bool:
+    def _validate(self, block: Dict[int, int], duplicates: int = 0,
+                  anchors: Optional[List[Anchor]] = None) -> bool:
         if not block:
             return False
         if len(block) < 10:
@@ -1191,6 +1409,16 @@ class MemoryScanner:
         if duplicates > max(25, int(len(block) * 0.05)):
             self.log.warning("  High duplicate ID count: %d", duplicates)
             return False
+
+        # A real collection block must contain the anchor cards the user
+        # vouched for; otherwise a high-known-ratio decoy array of
+        # arena-id-shaped pairs validates silently.
+        if anchors:
+            matched = sum(1 for a in anchors if block.get(a.arena_id) == a.quantity)
+            if matched == 0:
+                self.log.warning("  Matches 0/%d anchors - rejecting block", len(anchors))
+                return False
+            self.log.info("  Anchor matches: %d/%d", matched, len(anchors))
 
         return True
 
@@ -1526,7 +1754,7 @@ class MTGAExporter:
 
     def run(self) -> bool:
         print("=" * 60)
-        print("  MTGA Collection Exporter  v3.4")
+        print(f"  MTGA Collection Exporter  v{__version__}")
         print("=" * 60)
         print(f"  Output: {self.cfg.output_dir}\n")
 
@@ -1605,7 +1833,7 @@ def main() -> None:
     enable_windows_ansi()
 
     parser = argparse.ArgumentParser(
-        description="MTGA Collection Exporter v3.4",
+        description=f"MTGA Collection Exporter v{__version__}",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 

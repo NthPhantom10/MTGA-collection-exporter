@@ -13,4 +13,5 @@ mtga_exporter.log
 
 # Cached card database and saved anchors (user-specific)
 arena_id_lookup.json
+arena_id_lookup.meta.json
 last_anchors.json
