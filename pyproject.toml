@@ -1,6 +1,6 @@
 [project]
 name = "mtga-collection-exporter"
-version = "3.4.0"
+version = "3.4.1"
 description = "Export your MTG Arena card collection by scanning the running game's memory"
 readme = "README.md"
 license = "MIT"
@@ -10,6 +10,9 @@ dependencies = [
     "pymem>=1.13.0 ; sys_platform == 'win32'",
     "psutil>=5.9.0 ; sys_platform == 'darwin'",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]
